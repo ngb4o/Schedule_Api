@@ -34,6 +34,11 @@ function decrypt(data) {
     return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8')
 }
 
+// Hash cố định để làm key tìm kiếm — cùng token luôn ra cùng hash
+function hashToken(text) {
+    return crypto.createHmac('sha256', SECRET).update(text).digest('hex')
+}
+
 function maskToken(token) {
     if (!token || token.length < 10) return '***'
     return token.slice(0, 6) + '...' + token.slice(-4)
@@ -99,7 +104,7 @@ async function callAPI({ token, name, groupId }, isCheckIn) {
         try {
             rawToken = decrypt(token)
         } catch {
-            rawToken = token // fallback nếu token cũ chưa mã hoá
+            rawToken = token
         }
 
         let auth = String(rawToken || '').trim()
@@ -176,13 +181,15 @@ app.post('/save-config', async (req, res) => {
 
     const normalized = normalizeUserConfig(data)
     const encryptedToken = encrypt(normalized.token)
+    const tokenHash = hashToken(normalized.token)
 
     try {
         const doc = await AutoScheduleConfig.findOneAndUpdate(
-            { token: encryptedToken },
+            { tokenHash },
             {
                 $set: {
                     token: encryptedToken,
+                    tokenHash,
                     name: normalized.name,
                     group_id: normalized.group_id,
                     schedules: normalized.schedules,
@@ -216,7 +223,6 @@ app.get('/configs', async (_req, res) => {
             { token: 1, name: 1, group_id: 1, schedules: 1, updatedAt: 1 },
         ).sort({ updatedAt: -1 }).lean()
 
-        // Che token khi trả về API
         const items = docs.map(d => ({
             ...d,
             token: maskToken(d.token),

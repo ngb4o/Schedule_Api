@@ -14,7 +14,8 @@ const AutoScheduleSchema = new Schema(
 
 const AutoScheduleConfigSchema = new Schema(
   {
-    token: { type: String, required: true, index: true, unique: true },
+    token: { type: String, required: true },
+    tokenHash: { type: String, required: true, index: true, unique: true },
     name: { type: String, required: true },
     group_id: { type: String, required: true },
     schedules: { type: [AutoScheduleSchema], default: [] },
