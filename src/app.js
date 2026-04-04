@@ -5,6 +5,7 @@ const compression = require('compression')
 const cors = require('cors')
 const cron = require('node-cron')
 const axios = require('axios')
+const crypto = require('crypto')
 const { DateTime } = require('luxon')
 
 const app = express()
@@ -13,7 +14,33 @@ const CronLock = require('./models/cronLock.model')
 
 const SCHEDULE_TZ = process.env.SCHEDULE_TZ || 'Asia/Ho_Chi_Minh'
 
-app.use(morgan('dev'))
+// ─── ENCRYPTION ───────────────────────────────────────────────────────────────
+const ALGO = 'aes-256-cbc'
+const SECRET = process.env.TOKEN_SECRET || 'default_secret_change_this_32chr!'
+const ENC_KEY = crypto.scryptSync(SECRET, 'salt', 32)
+
+function encrypt(text) {
+    const iv = crypto.randomBytes(16)
+    const cipher = crypto.createCipheriv(ALGO, ENC_KEY, iv)
+    const encrypted = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()])
+    return iv.toString('hex') + ':' + encrypted.toString('hex')
+}
+
+function decrypt(data) {
+    const [ivHex, encHex] = data.split(':')
+    const iv = Buffer.from(ivHex, 'hex')
+    const encrypted = Buffer.from(encHex, 'hex')
+    const decipher = crypto.createDecipheriv(ALGO, ENC_KEY, iv)
+    return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8')
+}
+
+function maskToken(token) {
+    if (!token || token.length < 10) return '***'
+    return token.slice(0, 6) + '...' + token.slice(-4)
+}
+
+// ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
+app.use(morgan('tiny'))
 app.use(helmet())
 app.use(compression())
 app.use(cors())
@@ -22,6 +49,7 @@ app.use(express.urlencoded({ extended: true }))
 
 require('./dbs/init.mongodb')
 
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
 function normalizeUserConfig(data) {
     const u = { ...data }
     if (!Array.isArray(u.schedules) || u.schedules.length === 0) {
@@ -57,21 +85,24 @@ function getDay() {
 async function acquireLock(key) {
     try {
         await CronLock.collection.insertOne({ key, createdAt: new Date() })
-        console.log(`🔒 LOCK ACQUIRED: ${key}`)
         return true
     } catch (e) {
-        if (e.code === 11000) {
-            console.log(`⛔ LOCK EXISTS (skip): ${key}`)
-            return false
-        }
-        console.error('acquireLock unexpected error:', e?.message)
+        if (e.code === 11000) return false
+        console.error('acquireLock error:', e?.message)
         return false
     }
 }
 
 async function callAPI({ token, name, groupId }, isCheckIn) {
     try {
-        let auth = String(token || '').trim()
+        let rawToken
+        try {
+            rawToken = decrypt(token)
+        } catch {
+            rawToken = token // fallback nếu token cũ chưa mã hoá
+        }
+
+        let auth = String(rawToken || '').trim()
         if (!auth.toLowerCase().startsWith('beare ')) {
             auth = 'Beare ' + auth
         }
@@ -81,7 +112,9 @@ async function callAPI({ token, name, groupId }, isCheckIn) {
             post_content: isCheckIn ? '' : 'out',
             file_main: {
                 post_file_name: 'smile_sticker',
-                post_file_path: isCheckIn ? 'users/686b1f0b6754815c4e361fc7/3a56f8f0-224d-41ef-8bcc-339bb05939e4.webp' : "users/686b1f0b6754815c4e361fc7/9ffb64d5-524e-4a9b-a050-958469fa4608.webp",
+                post_file_path: isCheckIn
+                    ? 'users/686b1f0b6754815c4e361fc7/3a56f8f0-224d-41ef-8bcc-339bb05939e4.webp'
+                    : 'users/686b1f0b6754815c4e361fc7/9ffb64d5-524e-4a9b-a050-958469fa4608.webp',
                 post_file_type: 'image/jpeg',
             },
             fileList: [],
@@ -125,14 +158,12 @@ async function callAPI({ token, name, groupId }, isCheckIn) {
             maxRedirects: 0,
         })
 
-        console.log(
-            `✅ ${isCheckIn ? 'Check-in' : 'Check-out'} success for ${name}`,
-            `| status: ${res.status}`,
-            `| postId: ${res.data?._id || res.data?.data?._id || JSON.stringify(res.data).slice(0, 80)}`,
-        )
+        const postId = res.data?._id || res.data?.data?._id || '—'
+        console.log(`✅ [${isCheckIn ? 'IN' : 'OUT'}] ${name} | postId: ${postId}`)
     } catch (e) {
-        console.log('❌ Error:', e?.response?.status, e?.message)
-        console.log('❌ Error detail:', JSON.stringify(e?.response?.data))
+        const status = e?.response?.status || '—'
+        const msg = e?.response?.data?.message || e?.message || 'unknown'
+        console.error(`❌ [${isCheckIn ? 'IN' : 'OUT'}] ${name} | ${status} — ${msg}`)
     }
 }
 
@@ -142,13 +173,16 @@ app.post('/save-config', async (req, res) => {
     if (!data.token || !data.name || !data.group_id) {
         return res.status(400).json({ success: false, message: 'Missing required fields: token, name, group_id' })
     }
+
     const normalized = normalizeUserConfig(data)
+    const encryptedToken = encrypt(normalized.token)
+
     try {
         const doc = await AutoScheduleConfig.findOneAndUpdate(
-            { token: normalized.token },
+            { token: encryptedToken },
             {
                 $set: {
-                    token: normalized.token,
+                    token: encryptedToken,
                     name: normalized.name,
                     group_id: normalized.group_id,
                     schedules: normalized.schedules,
@@ -156,7 +190,7 @@ app.post('/save-config', async (req, res) => {
             },
             { upsert: true, new: true },
         ).lean()
-        console.log('Saved config:', doc.name, `(${doc.schedules.length} schedules)`)
+        console.log(`💾 Saved: ${doc.name} | token: ${maskToken(normalized.token)} | schedules: ${doc.schedules.length}`)
         return res.json({ success: true, schedules: doc.schedules.length })
     } catch (e) {
         console.error('Save config error:', e?.message || e)
@@ -181,7 +215,13 @@ app.get('/configs', async (_req, res) => {
             {},
             { token: 1, name: 1, group_id: 1, schedules: 1, updatedAt: 1 },
         ).sort({ updatedAt: -1 }).lean()
-        return res.json({ count: docs.length, items: docs })
+
+        // Che token khi trả về API
+        const items = docs.map(d => ({
+            ...d,
+            token: maskToken(d.token),
+        }))
+        return res.json({ count: items.length, items })
     } catch (e) {
         return res.status(500).json({ success: false, message: 'Server error' })
     }
@@ -192,7 +232,7 @@ const instanceId = process.env.pm_id ?? process.env.NODE_APP_INSTANCE ?? '0'
 const isCronWorker = instanceId === '0'
 
 if (isCronWorker) {
-    console.log(`[CRON] Worker ${instanceId} — cron ACTIVE`)
+    console.log(`[CRON] Worker ${instanceId} — ACTIVE`)
 
     cron.schedule('* * * * *', async () => {
         const nowTime = getNowTime()
@@ -207,8 +247,6 @@ if (isCronWorker) {
 
             if (!configs.length) return
 
-            console.log(`Checking... ${nowTime} (${SCHEDULE_TZ}, weekday=${today})`)
-
             for (const cfg of configs) {
                 for (const s of cfg.schedules || []) {
                     if (!Array.isArray(s.days) || !s.days.includes(today)) continue
@@ -218,7 +256,7 @@ if (isCronWorker) {
                         const lockKey = `checkin:${cfg._id}:${todayKey}:${nowTime}`
                         const ok = await acquireLock(lockKey)
                         if (ok) {
-                            console.log('🚀 RUN CHECKIN', cfg.name)
+                            console.log(`🚀 CHECKIN → ${cfg.name} lúc ${nowTime}`)
                             await callAPI({ token: cfg.token, name: cfg.name, groupId }, true)
                         }
                     }
@@ -227,7 +265,7 @@ if (isCronWorker) {
                         const lockKey = `checkout:${cfg._id}:${todayKey}:${nowTime}`
                         const ok = await acquireLock(lockKey)
                         if (ok) {
-                            console.log('🚀 RUN CHECKOUT', cfg.name)
+                            console.log(`🚀 CHECKOUT → ${cfg.name} lúc ${nowTime}`)
                             await callAPI({ token: cfg.token, name: cfg.name, groupId }, false)
                         }
                     }
@@ -244,14 +282,14 @@ if (isCronWorker) {
         cron.schedule('*/14 * * * *', () => {
             const start = Date.now()
             axios.get(APP_URL + '/health', { timeout: 30000 })
-                .then(res => console.log(`🏓 Ping OK (${res.status}) - ${Date.now() - start}ms`))
-                .catch(err => console.error(`❌ Ping failed:`, err.message))
+                .then(r => console.log(`🏓 Ping OK (${r.status}) — ${Date.now() - start}ms`))
+                .catch(err => console.error(`❌ Ping failed: ${err.message}`))
         }, { timezone: 'Asia/Ho_Chi_Minh' })
-        console.log(`🚀 Keep-alive active → ping ${APP_URL}/health mỗi 14 phút`)
+        console.log(`🏓 Keep-alive → ${APP_URL}/health mỗi 14 phút`)
     }
 
 } else {
-    console.log(`[CRON] Worker ${instanceId} — cron DISABLED (not primary)`)
+    console.log(`[CRON] Worker ${instanceId} — DISABLED`)
 }
 
 app.use('/', require('./routes'))
