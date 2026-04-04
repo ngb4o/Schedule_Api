@@ -132,7 +132,6 @@ async function callAPI({ token, name, groupId }, isCheckIn) {
         )
     } catch (e) {
         console.log('❌ Error:', e?.response?.status, e?.message)
-
         console.log('❌ Error detail:', JSON.stringify(e?.response?.data))
     }
 }
@@ -238,6 +237,19 @@ if (isCronWorker) {
             console.error('Cron error:', e?.message || e)
         }
     })
+
+    // ─── KEEP ALIVE ───────────────────────────────────────────────────────────
+    const APP_URL = process.env.APP_URL || ''
+    if (APP_URL) {
+        cron.schedule('*/14 * * * *', () => {
+            const start = Date.now()
+            axios.get(APP_URL + '/health', { timeout: 30000 })
+                .then(res => console.log(`🏓 Ping OK (${res.status}) - ${Date.now() - start}ms`))
+                .catch(err => console.error(`❌ Ping failed:`, err.message))
+        }, { timezone: 'Asia/Ho_Chi_Minh' })
+        console.log(`🚀 Keep-alive active → ping ${APP_URL}/health mỗi 14 phút`)
+    }
+
 } else {
     console.log(`[CRON] Worker ${instanceId} — cron DISABLED (not primary)`)
 }
