@@ -80,8 +80,8 @@ async function callAPI({ token, name, groupId }, isCheckIn) {
             being_posted_user_id: groupId,
             post_content: isCheckIn ? '' : 'out',
             file_main: {
-                post_file_name: 'checkin_sticker',
-                post_file_path: 'users/66168f226004740c78af3751/282380a3-2d76-4f19-828e-0a869c2e8fd6.png',
+                post_file_name: 'smile_sticker',
+                post_file_path: isCheckIn ? 'users/686b1f0b6754815c4e361fc7/3a56f8f0-224d-41ef-8bcc-339bb05939e4.webp' : "users/686b1f0b6754815c4e361fc7/9ffb64d5-524e-4a9b-a050-958469fa4608.webp",
                 post_file_type: 'image/jpeg',
             },
             fileList: [],
