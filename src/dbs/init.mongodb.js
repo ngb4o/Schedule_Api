@@ -1,11 +1,13 @@
 'use strict'
 
 const mongoose = require('mongoose')
-const { db: { host, port, name }} = require('../configs/config.mongodb')
-const connectString = `mongodb://${host}:${port}/${name}`
 const { countConnect } = require('../helpers/check.connect')
 
-console.log(`Connect to MongoDB: ${connectString}`)
+// Dùng MONGODB_URI từ env (Atlas), fallback về local
+const { db: { host, port, name } } = require('../configs/config.mongodb')
+const connectString = process.env.MONGODB_URI || `mongodb://${host}:${port}/${name}`
+
+console.log(`Connect to MongoDB: ${connectString.replace(/:\/\/.*@/, '://***@')}`)
 
 class Database {
 
@@ -13,7 +15,6 @@ class Database {
         this.connect()
     }
 
-    // connect 
     connect() {
         if (1 === 1) {
             mongoose.set('debug', true)
@@ -22,9 +23,8 @@ class Database {
 
         mongoose.connect(connectString, {
             maxPoolSize: 50
-        }).then(async _ => {  
+        }).then(async _ => {
             console.log(`Connected to MongoDB success`, countConnect())
-            // Đồng bộ indexes cho các models quan trọng
             try {
                 const Shop = require('../models/shop.model')
                 await Shop.syncIndexes()
@@ -34,7 +34,7 @@ class Database {
                 console.error('Sync indexes error:', err && err.message ? err.message : err)
             }
         })
-            .catch(err => console.log(`Error connect`))
+        .catch(err => console.log(`Error connect:`, err.message))
     }
 
     static getInstance() {
@@ -46,5 +46,4 @@ class Database {
 }
 
 const instanceMongodb = Database.getInstance()
-
 module.exports = instanceMongodb
