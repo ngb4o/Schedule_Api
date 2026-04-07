@@ -1,3 +1,5 @@
+'use strict'
+
 const express = require('express')
 const { default: helmet } = require('helmet')
 const morgan = require('morgan')
@@ -9,12 +11,15 @@ const crypto = require('crypto')
 const { DateTime } = require('luxon')
 
 const app = express()
+
+// ─── MODELS ───────────────────────────────────────────────────────────────────
 const AutoScheduleConfig = require('./models/autoScheduleConfig.model')
 const CronLock = require('./models/cronLock.model')
+const CrmScheduleConfig = require('./models/crmScheduleConfig.model.js')
 
 const SCHEDULE_TZ = process.env.SCHEDULE_TZ || 'Asia/Ho_Chi_Minh'
 
-// ─── ENCRYPTION ───────────────────────────────────────────────────────────────
+// ─── ENCRYPTION (dùng chung cho cả OneChat & CRM) ────────────────────────────
 const ALGO = 'aes-256-cbc'
 const SECRET = process.env.TOKEN_SECRET || 'default_secret_change_this_32chr!'
 const ENC_KEY = crypto.scryptSync(SECRET, 'salt', 32)
@@ -34,14 +39,13 @@ function decrypt(data) {
     return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8')
 }
 
-// Hash cố định để làm key tìm kiếm — cùng token luôn ra cùng hash
-function hashToken(text) {
+function hashValue(text) {
     return crypto.createHmac('sha256', SECRET).update(text).digest('hex')
 }
 
-function maskToken(token) {
-    if (!token || token.length < 10) return '***'
-    return token.slice(0, 6) + '...' + token.slice(-4)
+function maskStr(s) {
+    if (!s || s.length < 10) return '***'
+    return s.slice(0, 6) + '...' + s.slice(-4)
 }
 
 // ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
@@ -54,7 +58,34 @@ app.use(express.urlencoded({ extended: true }))
 
 require('./dbs/init.mongodb')
 
-// ─── HELPERS ──────────────────────────────────────────────────────────────────
+// ─── SHARED HELPERS ───────────────────────────────────────────────────────────
+function getNowTime() {
+    return DateTime.now().setZone(SCHEDULE_TZ).toFormat('HH:mm')
+}
+
+function getDay() {
+    return DateTime.now().setZone(SCHEDULE_TZ).weekday // 1=T2…7=CN
+}
+
+function getTodayKey() {
+    return DateTime.now().setZone(SCHEDULE_TZ).toISODate()
+}
+
+async function acquireLock(key) {
+    try {
+        await CronLock.collection.insertOne({ key, createdAt: new Date() })
+        return true
+    } catch (e) {
+        if (e.code === 11000) return false
+        console.error('acquireLock error:', e?.message)
+        return false
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ONECHAT — helpers & routes
+// ═══════════════════════════════════════════════════════════════════════════════
+
 function normalizeUserConfig(data) {
     const u = { ...data }
     if (!Array.isArray(u.schedules) || u.schedules.length === 0) {
@@ -79,38 +110,13 @@ function normalizeUserConfig(data) {
     return u
 }
 
-function getNowTime() {
-    return DateTime.now().setZone(SCHEDULE_TZ).toFormat('HH:mm')
-}
-
-function getDay() {
-    return DateTime.now().setZone(SCHEDULE_TZ).weekday
-}
-
-async function acquireLock(key) {
-    try {
-        await CronLock.collection.insertOne({ key, createdAt: new Date() })
-        return true
-    } catch (e) {
-        if (e.code === 11000) return false
-        console.error('acquireLock error:', e?.message)
-        return false
-    }
-}
-
-async function callAPI({ token, name, groupId }, isCheckIn) {
+async function callOneChatAPI({ token, name, groupId }, isCheckIn) {
     try {
         let rawToken
-        try {
-            rawToken = decrypt(token)
-        } catch {
-            rawToken = token
-        }
+        try { rawToken = decrypt(token) } catch { rawToken = token }
 
         let auth = String(rawToken || '').trim()
-        if (!auth.toLowerCase().startsWith('beare ')) {
-            auth = 'Beare ' + auth
-        }
+        if (!auth.toLowerCase().startsWith('beare ')) auth = 'Beare ' + auth
 
         const body = {
             being_posted_user_id: groupId,
@@ -164,24 +170,27 @@ async function callAPI({ token, name, groupId }, isCheckIn) {
         })
 
         const postId = res.data?._id || res.data?.data?._id || '—'
-        console.log(`✅ [${isCheckIn ? 'IN' : 'OUT'}] ${name} | postId: ${postId}`)
+        console.log(`✅ [OneChat ${isCheckIn ? 'IN' : 'OUT'}] ${name} | postId: ${postId}`)
     } catch (e) {
         const status = e?.response?.status || '—'
         const msg = e?.response?.data?.message || e?.message || 'unknown'
-        console.error(`❌ [${isCheckIn ? 'IN' : 'OUT'}] ${name} | ${status} — ${msg}`)
+        console.error(`❌ [OneChat ${isCheckIn ? 'IN' : 'OUT'}] ${name} | ${status} — ${msg}`)
     }
 }
 
-// ─── ROUTES ───────────────────────────────────────────────────────────────────
+// ── OneChat routes ────────────────────────────────────────────────────────────
 app.post('/save-config', async (req, res) => {
     const data = req.body || {}
     if (!data.token || !data.name || !data.group_id) {
-        return res.status(400).json({ success: false, message: 'Missing required fields: token, name, group_id' })
+        return res.status(400).json({
+            success: false,
+            message: 'Missing required fields: token, name, group_id',
+        })
     }
 
     const normalized = normalizeUserConfig(data)
     const encryptedToken = encrypt(normalized.token)
-    const tokenHash = hashToken(normalized.token)
+    const tokenHash = hashValue(normalized.token)
 
     try {
         const doc = await AutoScheduleConfig.findOneAndUpdate(
@@ -197,7 +206,7 @@ app.post('/save-config', async (req, res) => {
             },
             { upsert: true, new: true },
         ).lean()
-        console.log(`💾 Saved: ${doc.name} | token: ${maskToken(normalized.token)} | schedules: ${doc.schedules.length}`)
+        console.log(`💾 [OneChat] Saved: ${doc.name} | token: ${maskStr(normalized.token)} | schedules: ${doc.schedules.length}`)
         return res.json({ success: true, schedules: doc.schedules.length })
     } catch (e) {
         console.error('Save config error:', e?.message || e)
@@ -222,36 +231,172 @@ app.get('/configs', async (_req, res) => {
             {},
             { token: 1, name: 1, group_id: 1, schedules: 1, updatedAt: 1 },
         ).sort({ updatedAt: -1 }).lean()
-
-        const items = docs.map(d => ({
-            ...d,
-            token: maskToken(d.token),
-        }))
+        const items = docs.map((d) => ({ ...d, token: maskStr(d.token) }))
         return res.json({ count: items.length, items })
     } catch (e) {
         return res.status(500).json({ success: false, message: 'Server error' })
     }
 })
 
-// ─── CRON ─────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CRM — helpers & routes
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function callCrmAPI({ cookie, csrf, staffId, name }, isCheckIn) {
+    let rawCookie, rawCsrf
+    try { rawCookie = decrypt(cookie) } catch { rawCookie = cookie }
+    try { rawCsrf = decrypt(csrf) } catch { rawCsrf = csrf }
+
+    const label = isCheckIn ? 'CHECKIN' : 'CHECKOUT'
+
+    try {
+        const res = await axios.post(
+            'https://crm.vdiarybook.com/admin/timesheets/check_in_ts',
+            new URLSearchParams({
+                csrf_token_name: rawCsrf,
+                staff_id: staffId,
+                type_check: isCheckIn ? '1' : '2',
+                edit_date: '',
+                point_id: '',
+                location_user: '',
+                ...(!isCheckIn ? { today: 'Shop', tomorrow: 'Shop', hard: '' } : {}),
+            }).toString(),
+            {
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Cookie': rawCookie,
+                    'Referer': 'https://crm.vdiarybook.com/admin/timesheets/timekeeping',
+                    'Origin': 'https://crm.vdiarybook.com',
+                    'User-Agent':
+                        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) ' +
+                        'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+                },
+                timeout: 12000,
+                maxRedirects: 0,
+                validateStatus: (s) => s < 400,
+            },
+        )
+        console.log(`✅ [CRM ${label}] ${name} (staff:${staffId}) | HTTP ${res.status}`)
+    } catch (e) {
+        const status = e?.response?.status || '—'
+        const msg = JSON.stringify(e?.response?.data || e?.message || 'unknown').slice(0, 120)
+        console.error(`❌ [CRM ${label}] ${name} (staff:${staffId}) | ${status} — ${msg}`)
+    }
+}
+
+// ── CRM routes ────────────────────────────────────────────────────────────────
+
+// POST /crm/save-config
+// Body: { cookie, csrf, staffId, name, enabled, schedules: [{checkin_time, checkout_time, days}] }
+app.post('/crm/save-config', async (req, res) => {
+    const { cookie, csrf, staffId, name, enabled, schedules } = req.body || {}
+
+    if (!cookie || !csrf || !staffId) {
+        return res.status(400).json({
+            success: false,
+            message: 'Missing required fields: cookie, csrf, staffId',
+        })
+    }
+
+    const normalizedSchedules = Array.isArray(schedules)
+        ? schedules
+            .filter((s) => s && (s.checkin_time || s.checkout_time))
+            .map((s) => ({
+                checkin_time: s.checkin_time || null,
+                checkout_time: s.checkout_time || null,
+                days: Array.isArray(s.days) ? s.days : [],
+            }))
+        : []
+
+    const encCookie = encrypt(cookie)
+    const encCsrf = encrypt(csrf)
+    const cookieHash = hashValue(cookie)
+
+    try {
+        const doc = await CrmScheduleConfig.findOneAndUpdate(
+            { cookieHash },
+            {
+                $set: {
+                    cookie: encCookie,
+                    csrf: encCsrf,
+                    cookieHash,
+                    staffId,
+                    name: name || `Staff #${staffId}`,
+                    enabled: enabled !== false,
+                    schedules: normalizedSchedules,
+                },
+            },
+            { upsert: true, new: true },
+        ).lean()
+
+        console.log(
+            `💾 [CRM] Saved: ${doc.name} | staff:${staffId} | ` +
+            `enabled:${doc.enabled} | schedules:${doc.schedules.length}`,
+        )
+        return res.json({ success: true, schedules: doc.schedules.length })
+    } catch (e) {
+        console.error('CRM save-config error:', e?.message || e)
+        return res.status(500).json({ success: false, message: 'Server error' })
+    }
+})
+
+app.get('/crm/configs', async (_req, res) => {
+    try {
+        const docs = await CrmScheduleConfig.find(
+            {},
+            { name: 1, staffId: 1, enabled: 1, schedules: 1, updatedAt: 1, cookie: 1 },
+        ).sort({ updatedAt: -1 }).lean()
+        const items = docs.map((d) => ({ ...d, cookie: maskStr(d.cookie), csrf: '***' }))
+        return res.json({ count: items.length, items })
+    } catch (e) {
+        return res.status(500).json({ success: false, message: 'Server error' })
+    }
+})
+
+app.delete('/crm/configs/:staffId', async (req, res) => {
+    try {
+        const result = await CrmScheduleConfig.deleteOne({ staffId: req.params.staffId })
+        if (result.deletedCount === 0) {
+            return res.status(404).json({ success: false, message: 'Not found' })
+        }
+        return res.json({ success: true })
+    } catch (e) {
+        return res.status(500).json({ success: false, message: 'Server error' })
+    }
+})
+
+app.get('/crm/health', (_req, res) => {
+    const t = DateTime.now().setZone(SCHEDULE_TZ)
+    return res.json({
+        ok: true,
+        service: 'CRM Auto Schedule',
+        scheduleTz: SCHEDULE_TZ,
+        nowTime: t.toFormat('HH:mm'),
+        weekday: t.weekday,
+        weekdayNote: '1=T2 … 7=CN (Luxon ISO weekday)',
+    })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CRON — OneChat + CRM chạy chung mỗi phút
+// ═══════════════════════════════════════════════════════════════════════════════
 const instanceId = process.env.pm_id ?? process.env.NODE_APP_INSTANCE ?? '0'
 const isCronWorker = instanceId === '0'
 
 if (isCronWorker) {
-    console.log(`[CRON] Worker ${instanceId} — ACTIVE`)
+    console.log(`[CRON] Worker ${instanceId} — ACTIVE (OneChat + CRM)`)
 
     cron.schedule('* * * * *', async () => {
         const nowTime = getNowTime()
         const today = getDay()
-        const todayKey = DateTime.now().setZone(SCHEDULE_TZ).toISODate()
+        const todayKey = getTodayKey()
 
+        // ── OneChat ────────────────────────────────────────────────────────────
         try {
             const configs = await AutoScheduleConfig.find(
                 { schedules: { $exists: true, $ne: [] } },
                 { token: 1, name: 1, group_id: 1, schedules: 1 },
             ).lean()
-
-            if (!configs.length) return
 
             for (const cfg of configs) {
                 for (const s of cfg.schedules || []) {
@@ -260,37 +405,68 @@ if (isCronWorker) {
 
                     if (s.checkin_time === nowTime) {
                         const lockKey = `checkin:${cfg._id}:${todayKey}:${nowTime}`
-                        const ok = await acquireLock(lockKey)
-                        if (ok) {
-                            console.log(`🚀 CHECKIN → ${cfg.name} lúc ${nowTime}`)
-                            await callAPI({ token: cfg.token, name: cfg.name, groupId }, true)
+                        if (await acquireLock(lockKey)) {
+                            console.log(`🚀 [OneChat CHECKIN]  → ${cfg.name} lúc ${nowTime}`)
+                            await callOneChatAPI({ token: cfg.token, name: cfg.name, groupId }, true)
                         }
                     }
 
                     if (s.checkout_time === nowTime) {
                         const lockKey = `checkout:${cfg._id}:${todayKey}:${nowTime}`
-                        const ok = await acquireLock(lockKey)
-                        if (ok) {
-                            console.log(`🚀 CHECKOUT → ${cfg.name} lúc ${nowTime}`)
-                            await callAPI({ token: cfg.token, name: cfg.name, groupId }, false)
+                        if (await acquireLock(lockKey)) {
+                            console.log(`🚀 [OneChat CHECKOUT] → ${cfg.name} lúc ${nowTime}`)
+                            await callOneChatAPI({ token: cfg.token, name: cfg.name, groupId }, false)
                         }
                     }
                 }
             }
         } catch (e) {
-            console.error('Cron error:', e?.message || e)
+            console.error('[OneChat Cron] error:', e?.message || e)
         }
-    })
+
+        // ── CRM ────────────────────────────────────────────────────────────────
+        try {
+            const crmConfigs = await CrmScheduleConfig.find(
+                { enabled: true, schedules: { $exists: true, $ne: [] } },
+                { cookie: 1, csrf: 1, staffId: 1, name: 1, schedules: 1 },
+            ).lean()
+
+            for (const cfg of crmConfigs) {
+                for (const s of cfg.schedules || []) {
+                    if (!Array.isArray(s.days) || !s.days.includes(today)) continue
+
+                    if (s.checkin_time && s.checkin_time === nowTime) {
+                        const lockKey = `crm:checkin:${cfg._id}:${todayKey}:${nowTime}`
+                        if (await acquireLock(lockKey)) {
+                            console.log(`🚀 [CRM CHECKIN]  → ${cfg.name} lúc ${nowTime}`)
+                            await callCrmAPI(cfg, true)
+                        }
+                    }
+
+                    if (s.checkout_time && s.checkout_time === nowTime) {
+                        const lockKey = `crm:checkout:${cfg._id}:${todayKey}:${nowTime}`
+                        if (await acquireLock(lockKey)) {
+                            console.log(`🚀 [CRM CHECKOUT] → ${cfg.name} lúc ${nowTime}`)
+                            await callCrmAPI(cfg, false)
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            console.error('[CRM Cron] error:', e?.message || e)
+        }
+
+    }, { timezone: SCHEDULE_TZ })
 
     // ─── KEEP ALIVE ───────────────────────────────────────────────────────────
     const APP_URL = process.env.APP_URL || ''
     if (APP_URL) {
         cron.schedule('*/14 * * * *', () => {
             const start = Date.now()
-            axios.get(APP_URL + '/health', { timeout: 30000 })
-                .then(r => console.log(`🏓 Ping OK (${r.status}) — ${Date.now() - start}ms`))
-                .catch(err => console.error(`❌ Ping failed: ${err.message}`))
-        }, { timezone: 'Asia/Ho_Chi_Minh' })
+            axios.get(`${APP_URL}/health`, { timeout: 30000 })
+                .then((r) => console.log(`🏓 Ping OK (${r.status}) — ${Date.now() - start}ms`))
+                .catch((err) => console.error(`❌ Ping failed: ${err.message}`))
+        }, { timezone: SCHEDULE_TZ })
         console.log(`🏓 Keep-alive → ${APP_URL}/health mỗi 14 phút`)
     }
 
