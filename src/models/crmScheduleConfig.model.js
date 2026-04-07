@@ -18,7 +18,7 @@ const CrmScheduleConfigSchema = new Schema(
         csrf:       { type: String, required: true },  // AES encrypted
         staffId:    { type: String, required: true },
         name:       { type: String, default: '' },
-        enabled:    { type: Booleanc, default: true },
+        enabled:    { type: Boolean, default: true },
         schedules:  { type: [CrmScheduleSchema], default: [] },
     },
     { timestamps: true, collection: 'crm_schedule_configs' },
