@@ -19,6 +19,8 @@ const AutoScheduleConfigSchema = new Schema(
     name: { type: String, required: true },
     group_id: { type: String, required: true },
     schedules: { type: [AutoScheduleSchema], default: [] },
+    lat: { type: Number, default: 16.070499364870287 },
+    lng: { type: Number, default: 108.168304369952 },
   },
   { timestamps: true, collection: 'auto_schedule_configs' },
 )

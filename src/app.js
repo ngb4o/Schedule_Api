@@ -110,7 +110,14 @@ function normalizeUserConfig(data) {
     return u
 }
 
-async function callOneChatAPI({ token, name, groupId }, isCheckIn) {
+// ── Default location ──────────────────────────────────────────────────────────
+const DEFAULT_LAT = 16.070499364870287
+const DEFAULT_LNG = 108.168304369952
+
+async function callOneChatAPI({ token, name, groupId, lat, lng }, isCheckIn) {
+    const finalLat = lat ?? DEFAULT_LAT
+    const finalLng = lng ?? DEFAULT_LNG
+
     try {
         let rawToken
         try { rawToken = decrypt(token) } catch { rawToken = token }
@@ -136,7 +143,7 @@ async function callOneChatAPI({ token, name, groupId }, isCheckIn) {
             list_friends_excepted: [],
             post_place: {
                 geometry: {
-                    location: { lat: 16.070499364870287, lng: 108.168304369952 },
+                    location: { lat: finalLat, lng: finalLng },
                 },
                 name: `Tại vị trí của ${name}`,
             },
@@ -202,12 +209,14 @@ app.post('/save-config', async (req, res) => {
                     name: normalized.name,
                     group_id: normalized.group_id,
                     schedules: normalized.schedules,
+                    ...(data.lat != null && { lat: Number(data.lat) }),
+                    ...(data.lng != null && { lng: Number(data.lng) }),
                 },
             },
             { upsert: true, new: true },
         ).lean()
-        console.log(`💾 [OneChat] Saved: ${doc.name} | token: ${maskStr(normalized.token)} | schedules: ${doc.schedules.length}`)
-        return res.json({ success: true, schedules: doc.schedules.length })
+        console.log(`💾 [OneChat] Saved: ${doc.name} | token: ${maskStr(normalized.token)} | schedules: ${doc.schedules.length} | lat: ${doc.lat} | lng: ${doc.lng}`)
+        return res.json({ success: true, schedules: doc.schedules.length, lat: doc.lat, lng: doc.lng })
     } catch (e) {
         console.error('Save config error:', e?.message || e)
         return res.status(500).json({ success: false, message: 'Server error' })
@@ -229,7 +238,7 @@ app.get('/configs', async (_req, res) => {
     try {
         const docs = await AutoScheduleConfig.find(
             {},
-            { token: 1, name: 1, group_id: 1, schedules: 1, updatedAt: 1 },
+            { token: 1, name: 1, group_id: 1, schedules: 1, lat: 1, lng: 1, updatedAt: 1 },
         ).sort({ updatedAt: -1 }).lean()
         const items = docs.map((d) => ({ ...d, token: maskStr(d.token) }))
         return res.json({ count: items.length, items })
@@ -285,9 +294,6 @@ async function callCrmAPI({ cookie, csrf, staffId, name }, isCheckIn) {
 }
 
 // ── CRM routes ────────────────────────────────────────────────────────────────
-
-// POST /crm/save-config
-// Body: { cookie, csrf, staffId, name, enabled, schedules: [{checkin_time, checkout_time, days}] }
 app.post('/crm/save-config', async (req, res) => {
     const { cookie, csrf, staffId, name, enabled, schedules } = req.body || {}
 
@@ -395,7 +401,7 @@ if (isCronWorker) {
         try {
             const configs = await AutoScheduleConfig.find(
                 { schedules: { $exists: true, $ne: [] } },
-                { token: 1, name: 1, group_id: 1, schedules: 1 },
+                { token: 1, name: 1, group_id: 1, schedules: 1, lat: 1, lng: 1 },
             ).lean()
 
             for (const cfg of configs) {
@@ -407,7 +413,10 @@ if (isCronWorker) {
                         const lockKey = `checkin:${cfg._id}:${todayKey}:${nowTime}`
                         if (await acquireLock(lockKey)) {
                             console.log(`🚀 [OneChat CHECKIN]  → ${cfg.name} lúc ${nowTime}`)
-                            await callOneChatAPI({ token: cfg.token, name: cfg.name, groupId }, true)
+                            await callOneChatAPI(
+                                { token: cfg.token, name: cfg.name, groupId, lat: cfg.lat, lng: cfg.lng },
+                                true,
+                            )
                         }
                     }
 
@@ -415,7 +424,10 @@ if (isCronWorker) {
                         const lockKey = `checkout:${cfg._id}:${todayKey}:${nowTime}`
                         if (await acquireLock(lockKey)) {
                             console.log(`🚀 [OneChat CHECKOUT] → ${cfg.name} lúc ${nowTime}`)
-                            await callOneChatAPI({ token: cfg.token, name: cfg.name, groupId }, false)
+                            await callOneChatAPI(
+                                { token: cfg.token, name: cfg.name, groupId, lat: cfg.lat, lng: cfg.lng },
+                                false,
+                            )
                         }
                     }
                 }
