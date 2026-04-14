@@ -58,37 +58,6 @@ app.use(express.urlencoded({ extended: true }))
 
 require('./dbs/init.mongodb')
 
-// ─── SSE ─────────────────────────────────────────────────────────────────────
-const sseClients = new Map() // Map<staffId, Set<res>>
-
-app.get('/sse/checkin-status', (req, res) => {
-    const { staffId } = req.query
-    if (!staffId) return res.status(400).end()
-
-    res.setHeader('Content-Type', 'text/event-stream')
-    res.setHeader('Cache-Control', 'no-cache')
-    res.setHeader('Connection', 'keep-alive')
-    res.setHeader('Access-Control-Allow-Origin', '*')
-    res.flushHeaders()
-
-    if (!sseClients.has(staffId)) sseClients.set(staffId, new Set())
-    sseClients.get(staffId).add(res)
-
-    const ping = setInterval(() => res.write(': ping\n\n'), 30000)
-
-    req.on('close', () => {
-        clearInterval(ping)
-        sseClients.get(staffId)?.delete(res)
-    })
-})
-
-function pushCheckinEvent(staffId, payload) {
-    const clients = sseClients.get(String(staffId))
-    if (!clients?.size) return
-    const data = `data: ${JSON.stringify(payload)}\n\n`
-    clients.forEach(res => res.write(data))
-}
-
 // ─── SHARED HELPERS ───────────────────────────────────────────────────────────
 function getNowTime() {
     return DateTime.now().setZone(SCHEDULE_TZ).toFormat('HH:mm')
@@ -448,10 +417,6 @@ if (isCronWorker) {
                                 { token: cfg.token, name: cfg.name, groupId, lat: cfg.lat, lng: cfg.lng },
                                 true,
                             )
-                            pushCheckinEvent(cfg._id.toString(), {
-                                type: 'onechat', action: 'checkin', status: 'success',
-                                name: cfg.name, time: nowTime,
-                            })
                         }
                     }
 
@@ -463,11 +428,6 @@ if (isCronWorker) {
                                 { token: cfg.token, name: cfg.name, groupId, lat: cfg.lat, lng: cfg.lng },
                                 false,
                             )
-
-                            pushCheckinEvent(cfg._id.toString(), {
-                                type: 'onechat', action: 'checkout', status: 'success',
-                                name: cfg.name, time: nowTime,
-                            })
                         }
                     }
                 }
@@ -492,11 +452,6 @@ if (isCronWorker) {
                         if (await acquireLock(lockKey)) {
                             console.log(`🚀 [CRM CHECKIN]  → ${cfg.name} lúc ${nowTime}`)
                             await callCrmAPI(cfg, true)
-
-                            pushCheckinEvent(cfg._id.toString(), {
-                                type: 'crm', action: 'checkin', status: 'success',
-                                staffId: cfg.staffId, name: cfg.name, time: nowTime,
-                            })
                         }
                     }
 
@@ -505,11 +460,6 @@ if (isCronWorker) {
                         if (await acquireLock(lockKey)) {
                             console.log(`🚀 [CRM CHECKOUT] → ${cfg.name} lúc ${nowTime}`)
                             await callCrmAPI(cfg, false)
-
-                            pushCheckinEvent(cfg._id.toString(), {
-                                type: 'crm', action: 'checkout', status: 'success',
-                                staffId: cfg.staffId, name: cfg.name, time: nowTime,
-                            })
                         }
                     }
                 }
