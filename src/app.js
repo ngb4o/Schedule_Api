@@ -197,7 +197,7 @@ app.post('/save-config', async (req, res) => {
 
     const normalized = normalizeUserConfig(data)
     const encryptedToken = encrypt(normalized.token)
-    const tokenHash = hashValue(normalized.token)
+    const tokenHash = hashValue(normalized.token) 
 
     try {
         const doc = await AutoScheduleConfig.findOneAndUpdate(
